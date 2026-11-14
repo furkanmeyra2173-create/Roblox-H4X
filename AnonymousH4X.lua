@@ -4,12 +4,12 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
 local CollectionService = game:GetService("CollectionService")
 local Camera = workspace.CurrentCamera
 
-local auraRemote = ReplicatedStorage:WaitForChild("AH4X_TestDamage",10)
+local Debris = game:GetService("Debris")
+local visualHitCooldown = {}
 local lp = Players.LocalPlayer
 local lc = lp.Character or lp.CharacterAdded:Wait()
 local mouse = lp:GetMouse()
@@ -41,7 +41,6 @@ local cfg = {
     auto_item=false, auto_item_delay=0.3,
     fullbright=false, no_fog=false,
     spectator_list=false,
-    ac_bypass=true,
     one_shot=false,
 }
 
@@ -927,11 +926,38 @@ local function getAimTarget(fovLimit)
     return target
 end
 
+-- VISUAL-ONLY NPC TEST: never changes Health and never sends a RemoteEvent.
 local function fireTestTarget(mode, target)
-    if not target or not auraRemote then return false end
+    if not target then return false end
     local model=target:FindFirstAncestorOfClass("Model")
-    if not model or not CollectionService:HasTag(model,"AH4X_Damageable") then return false end
-    auraRemote:FireServer(model, mode or "normal")
+    if not model or Players:GetPlayerFromCharacter(model) then return false end
+    if not CollectionService:HasTag(model,"AH4X_Damageable") then return false end
+    local humanoid=model:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health<=0 then return false end
+    local now=os.clock()
+    if now-(visualHitCooldown[model] or 0)<0.18 then return true end
+    visualHitCooldown[model]=now
+    local old=model:FindFirstChild("AH4X_VisualTestHit")
+    if old then old:Destroy() end
+    local gui=Instance.new("BillboardGui")
+    gui.Name="AH4X_VisualTestHit"
+    gui.Adornee=target
+    gui.AlwaysOnTop=true
+    gui.Size=UDim2.fromOffset(120,32)
+    gui.StudsOffset=Vector3.new(0,2.5,0)
+    gui.Parent=model
+    local label=Instance.new("TextLabel")
+    label.Size=UDim2.fromScale(1,1)
+    label.BackgroundColor3=Color3.fromRGB(20,20,28)
+    label.BackgroundTransparency=0.2
+    label.TextColor3=Color3.fromRGB(100,255,150)
+    label.TextStrokeTransparency=0.35
+    label.Font=Enum.Font.GothamBold
+    label.TextScaled=true
+    label.Text="VISUAL TEST"
+    label.Parent=gui
+    Instance.new("UICorner",label).CornerRadius=UDim.new(0,6)
+    Debris:AddItem(gui,0.45)
     return true
 end
 
@@ -1027,12 +1053,11 @@ RunService.RenderStepped:Connect(function()
             local ehrp=model:FindFirstChild("HumanoidRootPart"); if not ehrp then continue end
             local h=ent.humanoid; if not h or h.Health<=0 then continue end
             if (hrp.Position-ehrp.Position).Magnitude<=cfg.kill_aura_range then
-                -- Damage is server-authoritative in Roblox; the companion
-                -- ServerScript validates range and only accepts tagged test NPCs.
+                -- Show a local visual marker only; no damage is sent.
                 local stamp=os.clock()
                 if auraRemote and stamp-(auraLastHit[model] or 0)>=0.25 then
                     auraLastHit[model]=stamp
-                    auraRemote:FireServer(model,"aura")
+                    fireTestTarget("aura", model:FindFirstChild("Head") or ehrp)
                 end
             end
         end
@@ -1202,7 +1227,7 @@ RunService.Heartbeat:Connect(function()
     local hum=lc:FindFirstChildOfClass("Humanoid")
     local now=tick()
 
-    -- Aimkill test: server-authoritative damage against tagged NPCs only.
+    -- Aimkill test: visual marker against tagged NPCs only.
     if cfg.aimkill and now-lastFire>=0.15 then
         local target=getAimTarget(cfg.aimbot_fov)
         if target then
@@ -1257,11 +1282,11 @@ RunService.Heartbeat:Connect(function()
     if cfg.auto_fire and not cfg.rapid_fire and now-lastFire>=0.12 then
         if fireOnce("normal") then lastFire=now end
     end
-    -- Rapid Fire: server still enforces its own minimum interval and NPC-only checks.
+    -- Rapid Fire: repeats the local visual marker only.
     if cfg.rapid_fire and now-lastFire>=math.max(cfg.rapid_fire_delay,0.04) then
         if fireOnce("rapid") then lastFire=now end
     end
-    -- One Shot is a single server-validated test hit, not a client-side health edit.
+    -- One Shot displays a single visual marker; it does not change health.
     if cfg.one_shot and not cfg.auto_fire and not cfg.rapid_fire and not cfg.aimkill then
         if fireOnce("one_shot") then
             cfg.one_shot=false
@@ -1269,7 +1294,7 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Reach test: extends only the local test range for tagged NPCs; server caps it at MAX_RANGE.
+    -- Reach test: displays a visual marker for nearby tagged NPCs only.
     if cfg.reach then
         local target=getAimTarget(cfg.aimbot_fov)
         if target and (Camera.CFrame.Position-target.Position).Magnitude<=cfg.reach_range then
@@ -1277,8 +1302,7 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Wallbang damage is intentionally not performed client-side; all test damage
-    -- must pass through AH4X_TestDamage and its server-side NPC tag/range checks.
+    -- Wallbang remains visual-only; this client script never applies damage.
 
     -- Auto item switch
     if cfg.auto_item and hum then
@@ -1308,16 +1332,6 @@ UserInputService.JumpRequest:Connect(function()
     end
 end)
 
--- ===== AC BYPASS =====
-if cfg.ac_bypass then
-    pcall(function()
-        for _,v in ipairs(workspace:GetDescendants()) do
-            if v:IsA("Script") or v:IsA("LocalScript") then
-                local n=v.Name:lower()
-                if n:find("anti") or n:find("cheat") or n:find("detect") then v.Disabled=true end
-            end
-        end
-    end)
-end
+-- Anti-cheat bypass intentionally removed.
 
-print("AnonymousH4X v5.3 | NPC-only test combat + ESP cleanup")
+print("AnonymousH4X v5.4 | Visual-only NPC test | No damage / no RemoteEvent")
