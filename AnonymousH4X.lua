@@ -923,11 +923,19 @@ local function fireOnce()
 end
 
 -- Silent Aim uses the same tagged-NPC visual target selector; no hooks are installed.
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not cfg.silent_aim then return end
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+        fireOnce()
+    end
+end)
 -- state
 local lastFire=0; local lastItem=0; local itemIdx=1
 local rainbowHue=0        -- 0-1, shared rainbow hue
 local crossAngle=0        -- crosshair rotation degrees
 local espV2Pulse=0        -- V2 glow pulse
+local savedAutoRotate=nil
 
 -- ===== FLY JOYSTICK UI (sol taraf) =====
 _G.FlyDir=Vector3.zero
@@ -1062,20 +1070,27 @@ RunService.RenderStepped:Connect(function()
     end
 
     -- Aimbot: smooth camera + avatar alignment, tagged NPCs only.
+    local character=lp.Character
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local aimHumanoid=character and character:FindFirstChildOfClass("Humanoid")
     if cfg.aimbot then
+        if aimHumanoid and savedAutoRotate==nil then
+            savedAutoRotate=aimHumanoid.AutoRotate
+            aimHumanoid.AutoRotate=false
+        end
         local target=getAimTarget(cfg.aimbot_fov)
-        local character=lp.Character
-        local root=character and character:FindFirstChild("HumanoidRootPart")
         if target and root then
             local alpha=math.clamp(cfg.aimbot_smooth,0.03,0.65)
             local cameraGoal=CFrame.lookAt(Camera.CFrame.Position,target.Position)
             Camera.CFrame=Camera.CFrame:Lerp(cameraGoal,alpha)
             local flat=Vector3.new(target.Position.X-root.Position.X,0,target.Position.Z-root.Position.Z)
             if flat.Magnitude>0.05 then
-                local avatarGoal=CFrame.lookAt(root.Position,root.Position+flat)
-                root.CFrame=root.CFrame:Lerp(avatarGoal,math.clamp(alpha*2,0.05,0.85))
+                root.CFrame=CFrame.lookAt(root.Position,root.Position+flat)
             end
         end
+    elseif savedAutoRotate~=nil then
+        if aimHumanoid then aimHumanoid.AutoRotate=savedAutoRotate end
+        savedAutoRotate=nil
     end
     AimBtn.Visible=false
 
