@@ -5,6 +5,8 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+local Debris = game:GetService("Debris")
 local Camera = workspace.CurrentCamera
 
 local lp = Players.LocalPlayer
@@ -40,7 +42,6 @@ local cfg = {
     auto_item=false, auto_item_delay=0.3,
     fullbright=false, no_fog=false,
     spectator_list=false,
-    ac_bypass=true,
     one_shot=false,
 }
 
@@ -849,109 +850,79 @@ for _,desc in ipairs(workspace:GetDescendants()) do
     if desc:IsA("Model") then registerNPC(desc) end
 end
 
--- ===== AIM TARGET (players + NPCs) =====
+-- ===== AIM TARGET (tagged test NPCs only) =====
 local function w2v(pos)
     local vp,inView=Camera:WorldToViewportPoint(pos)
     return Vector2.new(vp.X,vp.Y),inView,vp.Z
 end
 
 local function getAimTarget(fovLimit)
-    local best=fovLimit; local target=nil
+    local best=fovLimit or math.huge
+    local target=nil
     local vc=Vector2.new(Camera.ViewportSize.X/2,Camera.ViewportSize.Y/2)
-    for key,ent in pairs(trackedEntities) do
-        if ent.isPlayer and ent.player==lp then continue end
-        if ent.isPlayer and cfg.aimbot_teamcheck and getTeam(ent.player)==getTeam(lp) then continue end
-        local model=ent.model; if not model or not model.Parent then continue end
-        local head=model:FindFirstChild("Head"); if not head then continue end
-        local hum=ent.humanoid; if not hum or hum.Health<=0 then continue end
+    for _,ent in pairs(trackedEntities) do
+        local model=ent.model
+        if ent.isPlayer or not model or not model.Parent then continue end
+        if not CollectionService:HasTag(model,"AH4X_Damageable") then continue end
+        local head=model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+        local hum=ent.humanoid
+        if not head or not hum or hum.Health<=0 then continue end
         if cfg.aimbot_vischeck then
-            local ray=Ray.new(Camera.CFrame.Position,(head.Position-Camera.CFrame.Position).Unit*1000)
-            local hit=workspace:FindPartOnRayWithIgnoreList(ray,{lc,Camera})
-            if hit and not hit:IsDescendantOf(model) then continue end
+            local params=RaycastParams.new()
+            params.FilterType=Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances={lc}
+            local result=workspace:Raycast(Camera.CFrame.Position,head.Position-Camera.CFrame.Position,params)
+            if result and not result.Instance:IsDescendantOf(model) then continue end
         end
-        local vp,inView=w2v(head.Position); if not inView then continue end
+        local vp,inView,depth=w2v(head.Position)
+        if not inView or depth<=0 then continue end
         local d=(vp-vc).Magnitude
         if d<best then best=d; target=head end
     end
     return target
 end
 
--- ===== FIRE ONCE =====
--- hedef pozisyonu bul (silent aim veya normal aim)
+-- ===== VISUAL TEST FIRE =====
+-- Visual-only test feedback. No weapon remotes, damage calls, or input interception.
+local visualHitCooldown={}
 local function getFireTarget()
-    if cfg.silent_aim or cfg.aimbot then
-        local t=getAimTarget(math.max(cfg.aimbot_fov,cfg.silent_fov))
-        if t then return t.Position,t end
-    end
-    return mouse.Hit.Position,nil
+    local t=getAimTarget(math.max(cfg.aimbot_fov,cfg.silent_fov))
+    return t and t.Position or nil,t
+end
+local function fireOnce()
+    local _,target=getFireTarget()
+    if not target then return false end
+    local model=target:FindFirstAncestorOfClass("Model")
+    if not model or Players:GetPlayerFromCharacter(model) then return false end
+    if not CollectionService:HasTag(model,"AH4X_Damageable") then return false end
+    local now=os.clock()
+    if now-(visualHitCooldown[model] or 0)<0.12 then return true end
+    visualHitCooldown[model]=now
+    local old=model:FindFirstChild("AH4X_VisualTestHit")
+    if old then old:Destroy() end
+    local gui=Instance.new("BillboardGui")
+    gui.Name="AH4X_VisualTestHit"
+    gui.Adornee=target
+    gui.AlwaysOnTop=true
+    gui.Size=UDim2.fromOffset(124,30)
+    gui.StudsOffset=Vector3.new(0,2.4,0)
+    gui.Parent=model
+    local label=Instance.new("TextLabel")
+    label.Size=UDim2.fromScale(1,1)
+    label.BackgroundColor3=Color3.fromRGB(17,24,32)
+    label.BackgroundTransparency=0.12
+    label.TextColor3=Color3.fromRGB(90,255,170)
+    label.TextStrokeTransparency=0.3
+    label.Font=Enum.Font.GothamBold
+    label.TextScaled=true
+    label.Text="VISUAL HIT"
+    label.Parent=gui
+    Instance.new("UICorner",label).CornerRadius=UDim.new(0,7)
+    Debris:AddItem(gui,0.5)
+    return true
 end
 
-fireOnce = function()
-    local char=lp.Character; if not char then return end
-    local tool=char:FindFirstChildOfClass("Tool"); if not tool then return end
-    local hitPos,hitPart=getFireTarget()
-
-    -- one shot damage
-    if cfg.one_shot and hitPart then
-        pcall(function()
-            local model=hitPart:FindFirstAncestorOfClass("Model")
-            local h=model and model:FindFirstChildOfClass("Humanoid")
-            if h and h.Health>0 then
-                h:TakeDamage(99999); h.Health=0
-            end
-        end)
-    end
-
-    -- Method 1: tool remote events — tüm kombinasyonları dene
-    for _,v in ipairs(tool:GetDescendants()) do
-        if v:IsA("RemoteEvent") then
-            pcall(function() v:FireServer(hitPos, hitPart) end)
-            pcall(function() v:FireServer(hitPos) end)
-            pcall(function() v:FireServer() end)
-        elseif v:IsA("RemoteFunction") then
-            pcall(function() v:InvokeServer(hitPos, hitPart) end)
-            pcall(function() v:InvokeServer(hitPos) end)
-        end
-    end
-
-    -- Method 2: tool.Activated bindable
-    pcall(function()
-        local ev=tool:FindFirstChild("Activated")
-        if ev and ev:IsA("BindableEvent") then ev:Fire() end
-    end)
-
-    -- Method 3: VirtualInputManager mouse click (bazı executor'larda joystick sorun yapmaz)
-    pcall(function()
-        local VIM=game:GetService("VirtualInputManager")
-        local vp=Camera:WorldToScreenPoint(hitPos)
-        VIM:SendMouseButtonEvent(vp.X,vp.Y,0,true,game,1)
-        VIM:SendMouseButtonEvent(vp.X,vp.Y,0,false,game,1)
-    end)
-end
-
--- ===== SILENT AIM =====
--- Silent Aim hook (mouse.Hit override)
--- getFireTarget() zaten silent aim'i handle ediyor
--- ek olarak mouse.Hit hook'u da kur (tool'lar direkt mouse.Hit okuyabilir)
-pcall(function()
-    if hookmetamethod then
-        local oi
-        oi=hookmetamethod(game,"__index",function(self,key)
-            local cc=false; pcall(function() cc=checkcaller() end)
-            if not cc and cfg.silent_aim and self==mouse then
-                if key=="Hit" then
-                    local t=getAimTarget(cfg.silent_fov)
-                    if t then return CFrame.new(t.Position) end
-                elseif key=="Target" then
-                    local t=getAimTarget(cfg.silent_fov)
-                    if t then return t end
-                end
-            end
-            return oi(self,key)
-        end)
-    end
-end)
-
+-- Silent Aim uses the same tagged-NPC visual target selector; no hooks are installed.
 -- state
 local lastFire=0; local lastItem=0; local itemIdx=1
 local rainbowHue=0        -- 0-1, shared rainbow hue
@@ -1041,6 +1012,14 @@ end)
 -- ===== RENDER LOOP =====
 local antiAimAngle=0
 RunService.RenderStepped:Connect(function()
+    local pulse=0.5+0.5*math.sin(os.clock()*2.8)
+    mainStroke.Thickness=1.4+pulse*1.2
+    mainStroke.Transparency=0.12+pulse*0.18
+    if cfg.menu_rainbow then
+        mainStroke.Color=Color3.fromHSV((os.clock()*0.12)%1,0.9,1)
+    else
+        mainStroke.Color=cfg.menu_color
+    end
     lc=lp.Character; if not lc then return end
     local hum=lc:FindFirstChildOfClass("Humanoid")
     local hrp=lc:FindFirstChild("HumanoidRootPart")
@@ -1082,46 +1061,27 @@ RunService.RenderStepped:Connect(function()
         hrp.CFrame=CFrame.new(hrp.Position)*CFrame.Angles(0,math.rad(antiAimAngle),0)
     end
 
-    -- Aimbot — kamera + HRP birlikte döner (karakter yanlış yöne bakma sorunu fix)
+    -- Aimbot: smooth camera + avatar alignment, tagged NPCs only.
     if cfg.aimbot then
-        local t=getAimTarget(cfg.aimbot_fov)
-        if t and hrp then
-            local origin=Camera.CFrame.Position
-            local targetCF=CFrame.new(origin, t.Position)
-            -- kamerayı lerp et
-            Camera.CFrame=Camera.CFrame:Lerp(targetCF, cfg.aimbot_smooth)
-            -- HRP'yi yatay düzlemde aynı yöne döndür (sadece Y ekseni)
-            local flatDir=Vector3.new(t.Position.X-hrp.Position.X, 0, t.Position.Z-hrp.Position.Z)
-            if flatDir.Magnitude > 0.1 then
-                local targetHRP=CFrame.new(hrp.Position, hrp.Position+flatDir)
-                hrp.CFrame=hrp.CFrame:Lerp(targetHRP, cfg.aimbot_smooth*2)
+        local target=getAimTarget(cfg.aimbot_fov)
+        local character=lp.Character
+        local root=character and character:FindFirstChild("HumanoidRootPart")
+        if target and root then
+            local alpha=math.clamp(cfg.aimbot_smooth,0.03,0.65)
+            local cameraGoal=CFrame.lookAt(Camera.CFrame.Position,target.Position)
+            Camera.CFrame=Camera.CFrame:Lerp(cameraGoal,alpha)
+            local flat=Vector3.new(target.Position.X-root.Position.X,0,target.Position.Z-root.Position.Z)
+            if flat.Magnitude>0.05 then
+                local avatarGoal=CFrame.lookAt(root.Position,root.Position+flat)
+                root.CFrame=root.CFrame:Lerp(avatarGoal,math.clamp(alpha*2,0.05,0.85))
             end
         end
     end
     AimBtn.Visible=false
 
-    -- Aimkill — hedef yakınsa tool remote fire + damage
-    if cfg.aimkill then
-        local t=getAimTarget(cfg.aimbot_fov)
-        if t then
-            local model=t:FindFirstAncestorOfClass("Model")
-            if model then
-                local h=model:FindFirstChildOfClass("Humanoid")
-                if h and h.Health>0 then
-                    -- local damage dene
-                    pcall(function() h.Health=0 end)
-                    pcall(function() h:TakeDamage(9999) end)
-                    -- tool remote fire (en güvenilir yol)
-                    pcall(function()
-                        local myChar=lp.Character; if not myChar then return end
-                        local tool=myChar:FindFirstChildOfClass("Tool"); if not tool then return end
-                        for _,v in ipairs(tool:GetDescendants()) do
-                            if v:IsA("RemoteEvent") then v:FireServer(t.Position,t); break end
-                        end
-                    end)
-                end
-            end
-        end
+    -- Aimkill: visual-only repeat marker for tagged NPCs.
+    if cfg.aimkill and os.clock()-lastFire>=0.18 then
+        if fireOnce() then lastFire=os.clock() end
     end
 
     -- Hitbox expand — sadece Head, local only
@@ -1140,40 +1100,17 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
-    -- Kill Aura — hitbox expand + tool remote + TakeDamage üçlüsü
+    -- Kill Aura: local visual feedback for tagged test NPCs only.
     if cfg.kill_aura and hrp then
-        for key,ent in pairs(trackedEntities) do
-            if ent.isPlayer and ent.player==lp then continue end
-            if ent.isPlayer and cfg.aimbot_teamcheck and getTeam(ent.player)==getTeam(lp) then continue end
-            local model=ent.model; if not model or not model.Parent then continue end
-            local ehrp=model:FindFirstChild("HumanoidRootPart"); if not ehrp then continue end
-            local h=ent.humanoid; if not h or h.Health<=0 then continue end
-            local dist=(hrp.Position-ehrp.Position).Magnitude
-            if dist<=cfg.kill_aura_range then
-                -- tüm yolları dene
-                pcall(function() h:TakeDamage(99999) end)
-                pcall(function() h.Health=0 end)
-                -- tool remote
-                pcall(function()
-                    local myChar=lp.Character; if not myChar then return end
-                    local tool=myChar:FindFirstChildOfClass("Tool"); if not tool then return end
-                    for _,v in ipairs(tool:GetDescendants()) do
-                        if v:IsA("RemoteEvent") then
-                            v:FireServer(ehrp.Position,ehrp,99999)
-                            v:FireServer(ehrp.Position,ehrp)
-                            break
-                        end
-                    end
-                end)
-                -- noclip stye: teleport tool handle to target briefly
-                pcall(function()
-                    local myChar=lp.Character; if not myChar then return end
-                    local tool=myChar:FindFirstChildOfClass("Tool"); if not tool then return end
-                    local handle=tool:FindFirstChild("Handle"); if not handle then return end
-                    local orig=handle.CFrame
-                    handle.CFrame=CFrame.new(ehrp.Position)
-                    task.defer(function() pcall(function() handle.CFrame=orig end) end)
-                end)
+        for _,ent in pairs(trackedEntities) do
+            local model=ent.model
+            if ent.isPlayer or not model or not model.Parent then continue end
+            if not CollectionService:HasTag(model,"AH4X_Damageable") then continue end
+            local root=model:FindFirstChild("HumanoidRootPart")
+            local h=ent.humanoid
+            if root and h and h.Health>0 and (hrp.Position-root.Position).Magnitude<=cfg.kill_aura_range then
+                fireOnce()
+                break
             end
         end
     end
@@ -1402,59 +1339,12 @@ RunService.Heartbeat:Connect(function()
         hum:ChangeState(Enum.HumanoidStateType.Jumping)
     end
 
-    -- Auto fire — FOV içinde hedef varsa
-    if cfg.auto_fire and not cfg.rapid_fire then
-        local t=getAimTarget(cfg.aimbot_fov)
-        if t and now-lastFire>=0.1 then fireOnce(); lastFire=now end
-    end
-    -- Rapid fire — sürekli, delay ile
-    if cfg.rapid_fire then
-        if now-lastFire>=math.max(cfg.rapid_fire_delay,0.016) then fireOnce(); lastFire=now end
+    -- Auto Fire / Rapid Fire: visual-only repeat markers, tagged NPCs only.
+    if (cfg.auto_fire or cfg.rapid_fire) and now-lastFire>=math.max(cfg.rapid_fire_delay,0.12) then
+        if fireOnce() then lastFire=now end
     end
 
-    -- Reach hack
-    if cfg.reach then
-        pcall(function()
-            local char=lp.Character; if not char then return end
-            local tool=char:FindFirstChildOfClass("Tool"); if not tool then return end
-            local t=getAimTarget(cfg.aimbot_fov)
-            if t then
-                local dist=(Camera.CFrame.Position-t.Position).Magnitude
-                if dist<=cfg.reach_range then
-                    for _,v in ipairs(tool:GetDescendants()) do
-                        if v:IsA("RemoteEvent") then v:FireServer(t.Position,t); break end
-                    end
-                end
-            end
-        end)
-    end
-
-    -- Wallbang
-    if cfg.wallbang then
-        pcall(function()
-            local origin=Camera.CFrame.Position
-            local dir=Camera.CFrame.LookVector*500
-            local ignore={lc}
-            for i=1,3 do
-                local ray=Ray.new(origin,dir)
-                local hit,pos=workspace:FindPartOnRayWithIgnoreList(ray,ignore)
-                if not hit then break end
-                table.insert(ignore,hit)
-                local model=hit:FindFirstAncestorOfClass("Model")
-                if model then
-                    local h=model:FindFirstChildOfClass("Humanoid")
-                    local pp=Players:GetPlayerFromCharacter(model)
-                    if h and h.Health>0 and model~=lc then
-                        if not cfg.aimbot_teamcheck or not pp or getTeam(pp)~=getTeam(lp) then
-                            pcall(function() h:TakeDamage(9999) end)
-                        end
-                        break
-                    end
-                end
-                origin=pos+dir.Unit*0.1
-            end
-        end)
-    end
+    -- Reach and Wallbang damage routines are disabled in this visual-only build.
 
     -- Auto item switch
     if cfg.auto_item and hum then
@@ -1484,16 +1374,5 @@ UserInputService.JumpRequest:Connect(function()
     end
 end)
 
--- ===== AC BYPASS =====
-if cfg.ac_bypass then
-    pcall(function()
-        for _,v in ipairs(workspace:GetDescendants()) do
-            if v:IsA("Script") or v:IsA("LocalScript") then
-                local n=v.Name:lower()
-                if n:find("anti") or n:find("cheat") or n:find("detect") then v.Disabled=true end
-            end
-        end
-    end)
-end
-
-print("AnonymousH4X v5.0 | HAX = menu, ESP botlari da yakalar")
+-- Anti-cheat bypass intentionally removed.
+print("AnonymousH4X v5.5 | Tagged NPC visual test | no damage / no remote hooks")
